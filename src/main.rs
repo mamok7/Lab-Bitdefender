@@ -16,11 +16,9 @@ struct Labyrinth{
     width: usize, 
     height: usize, 
     start: GridCell,
-    finish: GridCell,
+    goal: GridCell,
     grid: Vec<GridCell>,
 }
-
-
 
 fn main() -> io::Result<()>{
     let args: Vec<String> = env::args().collect();
