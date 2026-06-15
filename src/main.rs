@@ -106,11 +106,13 @@ pub struct WsMsg {
 /// Rally   → toți eroii merg la punctul de raliere din dreapta hărții
 /// Attack  → grupul merge împreună spre spawn-ul inamicilor
 /// Hunt    → primul inamic a murit; căutăm al doilea pe toată harta
+/// Pincer  → rămâne exact 1 inamic și ≥2 eroi proprii; fiecare flancher atacă din altă parte
 #[derive(Debug, Clone, PartialEq)]
 pub enum Phase {
     Rally,
     Attack,
     Hunt,
+    Pincer,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,7 +268,7 @@ fn find_top_target(spawn_x: i32, map_h: i32, walls: &[Wall], map_w: i32) -> (i32
 /// Rally point fix: tile (10, 19).
 /// Dacă e blocat de zid, caută cea mai apropiată celulă liberă în jur.
 fn find_rally_point(map_w: i32, map_h: i32, walls: &[Wall], spawn_x: i32, spawn_y: i32) -> (i32, i32) {
-    let (base_x, base_y) = snap_to_grid(spawn_x, spawn_y); // folosim parametrii, nu hardcodat
+    let (base_x, base_y) = snap_to_grid(spawn_x, spawn_y);
     let offsets: [i32; 9] = [0, 3, -3, 6, -6, 9, -9, 12, -12];
     for &dy in &offsets {
         for &dx in &offsets {
@@ -286,6 +288,137 @@ fn all_heroes_near(heroes: &[&Hero], tx: i32, ty: i32, threshold: i32) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DODGE LOGIC  ← NOU
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculează o poziție de evaziune perpendiculară față de direcția atacantului.
+/// `shooter_x/y` → poziția inamicului care trage
+/// `hero_x/y`    → poziția eroului nostru
+/// Returnează cel mai bun tile liber perpendicular pe axa de atac.
+fn dodge_position(
+    hero_x: i32, hero_y: i32,
+    shooter_x: i32, shooter_y: i32,
+    walls: &[Wall],
+    map_w: i32, map_h: i32,
+) -> (i32, i32) {
+    // Vectorul de atac (de la shooter spre erou)
+    let dx = hero_x - shooter_x;
+    let dy = hero_y - shooter_y;
+
+    // Perpendiculare pe axa de atac: doi pași (6 unități) ca primă opțiune,
+    // un pas (3 unități) ca fallback dacă cei doi sunt blocați de zid
+    let perp_candidates: [(i32, i32); 4] = [
+        ( dy.signum() * 6, -dx.signum() * 6),  // doi pași lateral dreapta
+        (-dy.signum() * 6,  dx.signum() * 6),  // doi pași lateral stânga
+        ( dy.signum() * 3, -dx.signum() * 3),  // fallback: un pas lateral dreapta
+        (-dy.signum() * 3,  dx.signum() * 3),  // fallback: un pas lateral stânga
+    ];
+
+    for (pdx, pdy) in perp_candidates {
+        let (nx, ny) = snap_to_grid(hero_x + pdx, hero_y + pdy);
+        if in_bounds(nx, ny, map_w, map_h) && !overlaps_wall(nx, ny, walls) {
+            return (nx, ny);
+        }
+    }
+
+    // Dacă nu găsim lateral, facem doi pași înapoi față de shooter
+    let back_x = hero_x + dx.signum() * 6;
+    let back_y = hero_y + dy.signum() * 6;
+    let (bx, by) = snap_to_grid(back_x, back_y);
+    if in_bounds(bx, by, map_w, map_h) && !overlaps_wall(bx, by, walls) {
+        return (bx, by);
+    }
+
+    (hero_x, hero_y) // stăm pe loc dacă nu există nicio ieșire
+}
+
+/// Determină dacă un erou propriu este în pericol iminent de atac.
+/// Un inamic este "periculos" dacă:
+///   1. Are linie de vedere spre eroul nostru
+///   2. Cooldown-ul lui este ≤ 1 (trage în această tură sau în următoarea)
+///      SAU a tras recent și ciclul e aproape complet (trage din nou în curând)
+fn is_under_attack_threat(
+    hero_x: i32, hero_y: i32,
+    enemy: &Hero,
+    enemy_last_shot: &HashMap<i32, i32>,
+    current_turn: i32,
+    shoot_cooldown: i32,
+    walls: &[Wall],
+) -> bool {
+    if !has_line_of_sight(hero_x, hero_y, enemy.x, enemy.y, walls) {
+        return false;
+    }
+
+    // Inamicul trage din nou în curând: cooldown ≤ 2 (anticipăm cu 2 ture)
+    if enemy.cooldown <= 2 {
+        return true;
+    }
+
+    // Inamicul a tras recent și intervalul e aproape complet → va trage curând
+    // Pragul e - 3 față de shoot_cooldown pentru a anticipa cu o tură în plus
+    if let Some(&last_turn) = enemy_last_shot.get(&enemy.id) {
+        let turns_since_shot = current_turn - last_turn;
+        if turns_since_shot >= shoot_cooldown - 3 {
+            return true;
+        }
+    }
+
+    false
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PINCER / FLANCARE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculează două poziții de flancare în jurul inamicului, la distanța `dist`.
+/// Eroii se vor poziționa perpendicular față de centrul hărții, câte unul pe
+/// fiecare parte, astfel încât inamicul să fie prins în crossfire.
+/// Returnează (flank_left, flank_right) — fiecare erou ia câte una.
+fn flank_positions(
+    enemy_x: i32, enemy_y: i32,
+    map_w: i32, map_h: i32,
+    walls: &[Wall],
+) -> ((i32, i32), (i32, i32)) {
+    // Perpendiculara față de axa centru→inamic
+    let cx = map_w / 2;
+    let cy = map_h / 2;
+    let dx = enemy_x - cx;
+    let dy = enemy_y - cy;
+
+    // Perpendiculara unitară (normalizată la 9 — 3 pași de grid)
+    let dist = 9i32;
+    let (px, py) = if dx == 0 && dy == 0 {
+        (dist, 0)
+    } else {
+        // Rotim 90°: (-dy, dx), scalat la `dist`
+        let len = (((dx * dx + dy * dy) as f64).sqrt()).max(1.0);
+        let npx = ((-dy as f64 / len) * dist as f64).round() as i32;
+        let npy = ((dx as f64 / len) * dist as f64).round() as i32;
+        // snap la multiplu de 3
+        let snap3 = |v: i32| -> i32 {
+            let r = v % 3;
+            if r == 0 { v } else if r.abs() == 1 { v - r } else { v + (3 - r.abs()) * r.signum() }
+        };
+        (snap3(npx).max(-dist).min(dist), snap3(npy).max(-dist).min(dist))
+    };
+
+    // Candidați: 9, 6, 3 unități pe fiecare parte, până găsim tile liber
+    for scale in [1i32, 2, 3] {
+        let (l1x, l1y) = snap_to_grid(enemy_x + px * scale / 1, enemy_y + py * scale / 1);
+        let (l2x, l2y) = snap_to_grid(enemy_x - px * scale / 1, enemy_y - py * scale / 1);
+        let left_ok  = in_bounds(l1x, l1y, map_w, map_h) && !overlaps_wall(l1x, l1y, walls);
+        let right_ok = in_bounds(l2x, l2y, map_w, map_h) && !overlaps_wall(l2x, l2y, walls);
+        if left_ok && right_ok {
+            return ((l1x, l1y), (l2x, l2y));
+        }
+    }
+
+    // Fallback: amândoi merg direct la inamic
+    let (ex, ey) = snap_to_grid(enemy_x, enemy_y);
+    ((ex, ey), (ex, ey))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PROCESAREA TUREI
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -296,9 +429,11 @@ async fn process_turn<S>(
     config: &GameConfig,
     map_walls: &[Wall],
     phase: &mut Phase,
-    known_enemy_ids: &mut Vec<i32>,       // ID-urile inamicilor văzuți vreodată
-    hunt_target_id: &mut Option<i32>,     // ID-ul inamicului pe care îl vânăm în faza Hunt
-    focus_target_id: &mut Option<i32>,    // Focus fire: toți trag în același inamic până moare
+    known_enemy_ids: &mut Vec<i32>,
+    hunt_target_id: &mut Option<i32>,
+    focus_target_id: &mut Option<i32>,
+    enemy_last_shot: &mut HashMap<i32, i32>,        // NOU: tura în care fiecare inamic a tras ultima oară
+    prev_enemy_cooldowns: &mut HashMap<i32, i32>,   // NOU: cooldown-urile inamicilor din tura precedentă
     rally_x: i32,
     rally_y: i32,
     attack_x: i32,
@@ -311,6 +446,7 @@ where
     let state = &turn_args.state;
     let map_w = config.width;
     let map_h = config.height;
+    let current_turn = turn_args.turn;
 
     let my_heroes: Vec<&Hero> = state.heroes.iter()
         .filter(|h| h.owner_id == my_player_id)
@@ -320,6 +456,17 @@ where
         .filter(|h| h.owner_id != my_player_id)
         .collect();
 
+    // ── NOU: Detectăm când inamicii au tras ───────────────────────────────
+    // Un inamic a tras în tura precedentă dacă cooldown-ul era 0 și acum s-a resetat.
+    for enemy in &enemy_heroes {
+        let prev_cd = prev_enemy_cooldowns.get(&enemy.id).copied().unwrap_or(-1);
+        if prev_cd == 0 && enemy.cooldown > 0 {
+            enemy_last_shot.insert(enemy.id, current_turn - 1);
+            println!("  [DODGE] Inamic {} a tras la tura {}", enemy.id, current_turn - 1);
+        }
+        prev_enemy_cooldowns.insert(enemy.id, enemy.cooldown);
+    }
+
     // Actualizăm lista de inamici văzuți vreodată
     for e in &enemy_heroes {
         if !known_enemy_ids.contains(&e.id) {
@@ -328,12 +475,7 @@ where
         }
     }
 
-    // ── Focus fire: alegem O SINGURĂ țintă comună pentru toți eroii ────────
-    // Se face ÎNAINTE de orice altceva, o dată per tură, nu per erou.
-    // Reguli:
-    //   1. Dacă ținta curentă a murit → resetăm
-    //   2. Dacă nu avem țintă → primul inamic văzut de ORICE erou propriu
-    //   3. Ținta rămâne fixă până moare, indiferent ce alt inamic apare
+    // ── Focus fire ────────────────────────────────────────────────────────
     {
         let alive_ids: Vec<i32> = enemy_heroes.iter().map(|e| e.id).collect();
         if let Some(fid) = *focus_target_id {
@@ -356,10 +498,7 @@ where
         println!("  [FOCUS] Țintă curentă: {:?}", focus_target_id);
     }
 
-    // ── Tranziții de fază ──────────────────────────────────────────────────
-    // Rally → Attack: toți eroii s-au adunat la rally point
-    // Attack → Hunt: primul inamic a murit (l-am văzut înainte și nu mai e)
-    // Hunt: al doilea inamic, urmărim și tragem până moare
+    // ── Tranziții de fază ─────────────────────────────────────────────────
     match phase {
         Phase::Rally => {
             if all_heroes_near(&my_heroes, rally_x, rally_y, 9) {
@@ -376,6 +515,11 @@ where
                 println!("  [FAZA] Vânăm inamicul: {:?}", hunt_target_id);
                 *phase = Phase::Hunt;
             }
+            // Dacă rămâne exact 1 inamic și avem ≥2 eroi → Pincer
+            if enemy_heroes.len() == 1 && my_heroes.len() >= 2 {
+                println!("  [FAZA] Attack → Pincer: 1 inamic, {} eroi proprii!", my_heroes.len());
+                *phase = Phase::Pincer;
+            }
         }
         Phase::Hunt => {
             if let Some(tid) = *hunt_target_id {
@@ -385,70 +529,184 @@ where
                     println!("  [HUNT] Ținta a murit, nou target: {:?}", hunt_target_id);
                 }
             }
+            // Dacă rămâne exact 1 inamic și avem ≥2 eroi → Pincer
+            if enemy_heroes.len() == 1 && my_heroes.len() >= 2 {
+                println!("  [FAZA] Hunt → Pincer: 1 inamic, {} eroi proprii!", my_heroes.len());
+                *phase = Phase::Pincer;
+            }
+        }
+        Phase::Pincer => {
+            // Ieșim din Pincer dacă inamicul a murit sau au mai apărut inamici
+            if enemy_heroes.is_empty() || enemy_heroes.len() > 1 || my_heroes.len() < 2 {
+                println!("  [FAZA] Pincer → Hunt: condiție pincer nu mai e îndeplinită");
+                *hunt_target_id = enemy_heroes.iter().map(|e| e.id).next();
+                *phase = Phase::Hunt;
+            }
         }
     }
 
     println!("  [FAZA CURENTA] {:?} | inamici vizibili: {}", phase, enemy_heroes.len());
 
-    // ── Construim mesajele pentru fiecare erou ─────────────────────────────
+    // ── NOU: Shoot cooldown al inamicilor din config ───────────────────────
+    // Folosit pentru a estima când trag din nou după ultimul shot detectat.
+    let enemy_shoot_cooldown = config.hero_types.values()
+        .map(|t| t.shoot_cooldown)
+        .next()
+        .unwrap_or(5);
+
+    // ── Construim mesajele pentru fiecare erou ────────────────────────────
 
     let mut messages: Vec<Message> = Vec::new();
 
     for hero in &my_heroes {
 
         // ── Tragere (prioritate maximă, indiferent de fază) ────────────────
-        // Toți trag în focus_target_id (ținta comună). Dacă nu o văd, stau pe loc.
-        // Nu tragem în altcineva — focus fire strict.
-        if hero.cooldown == 0 && !enemy_heroes.is_empty() {
+        // Dacă eroul poate trage și are linie de vedere la țintă, trage și gata —
+        // nu mai verificăm dodge în aceeași tură.
+        let can_shoot = hero.cooldown == 0
+            && !enemy_heroes.is_empty()
+            && focus_target_id.map_or(false, |fid| {
+                enemy_heroes.iter().find(|e| e.id == fid)
+                    .map_or(false, |enemy| has_line_of_sight(hero.x, hero.y, enemy.x, enemy.y, map_walls))
+            });
+
+        if can_shoot {
             if let Some(fid) = *focus_target_id {
                 if let Some(enemy) = enemy_heroes.iter().find(|e| e.id == fid) {
-                    if has_line_of_sight(hero.x, hero.y, enemy.x, enemy.y, map_walls) {
-                        let json = serde_json::json!({
-                            "command": "SHOOT",
-                            "args": {
-                                "hero_id": hero.id,
-                                "x": enemy.x,
-                                "y": enemy.y,
-                                "comment": "🔫"
-                            }
-                        });
-                        messages.push(Message::Text(serde_json::to_string(&json).unwrap().into()));
-                        continue;
+                    let json = serde_json::json!({
+                        "command": "SHOOT",
+                        "args": {
+                            "hero_id": hero.id,
+                            "x": enemy.x,
+                            "y": enemy.y,
+                            "comment": "🔫"
+                        }
+                    });
+                    messages.push(Message::Text(serde_json::to_string(&json).unwrap().into()));
+
+                    // După tragere, verificăm dacă trebuie să ne și ferim în aceeași tură.
+                    // Inamicul poate trage simultan cu noi, deci ne mișcăm imediat după SHOOT.
+                    let dodge_after_shoot = enemy_heroes.iter().find(|e| {
+                        is_under_attack_threat(
+                            hero.x, hero.y,
+                            e,
+                            enemy_last_shot,
+                            current_turn,
+                            enemy_shoot_cooldown,
+                            map_walls,
+                        )
+                    });
+                    if let Some(shooter) = dodge_after_shoot {
+                        let (dodge_x, dodge_y) = dodge_position(
+                            hero.x, hero.y,
+                            shooter.x, shooter.y,
+                            map_walls,
+                            map_w, map_h,
+                        );
+                        if dodge_x != hero.x || dodge_y != hero.y {
+                            println!(
+                                "  [DODGE+SHOOT] Erou {} trage și se ferește de inamic {} → ({},{})",
+                                hero.id, shooter.id, dodge_x, dodge_y
+                            );
+                            let json = serde_json::json!({
+                                "command": "MOVE",
+                                "args": {
+                                    "hero_id": hero.id,
+                                    "x": dodge_x,
+                                    "y": dodge_y,
+                                    "comment": "🔫💨"
+                                }
+                            });
+                            messages.push(Message::Text(serde_json::to_string(&json).unwrap().into()));
+                        }
                     }
+                    continue; // skip restul logicii de mișcare
                 }
             }
         }
 
+        // ── Dodge — verificăm dacă vreun inamic e pe cale să tragă ──────────
+        // Ajungem aici DOAR dacă nu am putut trage în această tură.
+        let dodge_threat = enemy_heroes.iter().find(|enemy| {
+            is_under_attack_threat(
+                hero.x, hero.y,
+                enemy,
+                enemy_last_shot,
+                current_turn,
+                enemy_shoot_cooldown,
+                map_walls,
+            )
+        });
+
+        if let Some(shooter) = dodge_threat {
+            let (dodge_x, dodge_y) = dodge_position(
+                hero.x, hero.y,
+                shooter.x, shooter.y,
+                map_walls,
+                map_w, map_h,
+            );
+
+            // Facem dodge doar dacă chiar ne mișcăm (nu stăm pe loc inutil)
+            if dodge_x != hero.x || dodge_y != hero.y {
+                println!(
+                    "  [DODGE] Erou {} se ferește de inamic {} → ({},{})",
+                    hero.id, shooter.id, dodge_x, dodge_y
+                );
+                let json = serde_json::json!({
+                    "command": "MOVE",
+                    "args": {
+                        "hero_id": hero.id,
+                        "x": dodge_x,
+                        "y": dodge_y,
+                        "comment": "💨"
+                    }
+                });
+                messages.push(Message::Text(serde_json::to_string(&json).unwrap().into()));
+                continue; // skip mișcarea normală
+            }
+        }
+
         // ── Mișcare în funcție de fază ─────────────────────────────────────
-        // Rally: toți merg la rally point.
-        // Attack/Hunt — ciclu kiting în 3 pași (repetat la fiecare 15 ture):
-        //   ture  0-4  → spre centrul arenei   🎯
-        //   ture  5-9  → spre stânga           ←
-        //   ture 10-14 → spre rally point      ↩️
-        // Dacă nu vede niciun inamic → retragere directă la rally.
         let any_enemy_visible = enemy_heroes.iter()
             .any(|e| has_line_of_sight(hero.x, hero.y, e.x, e.y, map_walls));
 
-        // Centrul arenei (snap la grila 3x3)
         let (center_x, center_y) = snap_to_grid(map_w / 2, map_h / 2);
 
         let (dest_x, dest_y) = match phase {
             Phase::Rally => (rally_x, rally_y),
             Phase::Attack | Phase::Hunt => {
-                    // Ciclul de 15 ture: 0-4 centru, 5-9 stânga, 10-14 rally
                     let cycle = turn_args.turn % 15;
                     if cycle < 5 {
-                        // Spre centrul arenei
                         (center_x, center_y)
                     } else if cycle < 10 {
-                        // Spre stânga: țintă fixă la x=1 (marginea stângă), același y
                         let (lx, ly) = snap_to_grid(1, hero.y);
                         (lx, ly)
                     } else {
-                        // Spre rally point
                         (rally_x, rally_y)
                     }
-                
+            }
+            Phase::Pincer => {
+                // Fiecare erou merge la o poziție de flancare diferită.
+                // Eroii sunt sortați după id pentru a li se atribui consistent
+                // flank_left vs flank_right fără a depinde de ordinea din vector.
+                if let Some(enemy) = enemy_heroes.first() {
+                    let (flank_left, flank_right) = flank_positions(
+                        enemy.x, enemy.y,
+                        map_w, map_h,
+                        map_walls,
+                    );
+                    // Cel cu id-ul mai mic → flank_left, cel cu id mai mare → flank_right
+                    let min_hero_id = my_heroes.iter().map(|h| h.id).min().unwrap_or(hero.id);
+                    if hero.id == min_hero_id {
+                        println!("  [PINCER] Erou {} → flank_left ({},{})", hero.id, flank_left.0, flank_left.1);
+                        flank_left
+                    } else {
+                        println!("  [PINCER] Erou {} → flank_right ({},{})", hero.id, flank_right.0, flank_right.1);
+                        flank_right
+                    }
+                } else {
+                    (rally_x, rally_y)
+                }
             }
         };
 
@@ -461,6 +719,7 @@ where
 
         let comment = match phase {
             Phase::Rally => "🏃",
+            Phase::Pincer => "🔀",
             Phase::Attack | Phase::Hunt => {
                 if any_enemy_visible {
                     let cycle = turn_args.turn % 15;
@@ -512,7 +771,9 @@ async fn main() -> anyhow::Result<()> {
     let mut phase = Phase::Rally;
     let mut known_enemy_ids: Vec<i32> = Vec::new();
     let mut hunt_target_id: Option<i32> = None;
-    let mut focus_target_id: Option<i32> = None; // focus fire: toți trag în același inamic
+    let mut focus_target_id: Option<i32> = None;
+    let mut enemy_last_shot: HashMap<i32, i32> = HashMap::new();        // NOU
+    let mut prev_enemy_cooldowns: HashMap<i32, i32> = HashMap::new();   // NOU
 
     // Puncte cheie pe hartă
     let mut rally_x: i32 = 0;
@@ -592,12 +853,10 @@ async fn main() -> anyhow::Result<()> {
                 let we_are_at_bottom = my_spawn_y > map_h/2;
                 let rally_tile_y = if we_are_at_bottom { map_h - 20 } else { 19 };
 
-                // Rally point: în dreapta față de spawn-ul propriu, la aceeași înălțime
                 let (rx, ry) = find_rally_point(map_w, map_h, &map_walls, 10, rally_tile_y);
                 rally_x = rx;
                 rally_y = ry;
 
-                // Attack point: spawn-ul inamicului (capătul opus)
                 let we_are_at_bottom = my_spawn_y > map_h / 2;
                 let (ax, ay) = if we_are_at_bottom {
                     find_top_target(enemy_spawn_x, map_h, &map_walls, map_w)
@@ -616,6 +875,8 @@ async fn main() -> anyhow::Result<()> {
                 known_enemy_ids = Vec::new();
                 hunt_target_id = None;
                 focus_target_id = None;
+                enemy_last_shot = HashMap::new();       // NOU
+                prev_enemy_cooldowns = HashMap::new();  // NOU
             }
             "START_TURN" => {
                 let args: StartTurnArgs = serde_json::from_value(msg.args)
@@ -631,6 +892,8 @@ async fn main() -> anyhow::Result<()> {
                         &mut known_enemy_ids,
                         &mut hunt_target_id,
                         &mut focus_target_id,
+                        &mut enemy_last_shot,           // NOU
+                        &mut prev_enemy_cooldowns,      // NOU
                         rally_x,
                         rally_y,
                         attack_x,
